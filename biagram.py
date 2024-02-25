@@ -1,18 +1,20 @@
 import torch 
-import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
 
 batch_size = 32
 block_size = 8
-max_iter = 5000
+max_iter = 25000
 eval_interval = 500
 eval_iters = 200
-learning_rate = 1e-3
-n_embed = 32
+learning_rate = 3e-4
+n_embed = 10
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
+n_head = 2
+n_layer = 2
+dropout = 0.2
 
 torch.manual_seed(1337)
 
@@ -69,6 +71,7 @@ class Head(nn.Module):
         # Buffers won’t be returned in model.parameters(), so that the optimizer won’t have a change to update them.
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
 
+        self.dropout = nn.Dropout(dropout)
 
     def __call__(self, x):
         B,T,C = x.shape
@@ -79,7 +82,9 @@ class Head(nn.Module):
 
         #future dosnt communicate with the past (decoder block) 
         wei = wei.masked_fill(self.tril[:T,:T]==0, float('-inf')) # commend for encoder 
-        wei = F.softmax(wei, dim=1)
+        wei = F.softmax(wei, dim=-1)
+
+        wei = self.dropout(wei)
 
         v = self.value(x)
         out = wei @ v
@@ -91,9 +96,43 @@ class MultiHeadAttention(nn.Module):
         super().__init__()
 
         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.proj = nn.Linear(head_size * num_heads, n_embed)
+        self.dropout = nn.Dropout(dropout)
 
     def __call__(self, x):
-        return torch.cat([h(x) for h in self.heads], dim=-1)
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        out = self.proj(out)
+        out = self.dropout(out)
+        return out 
+
+class feedForward(nn.Module):
+
+    def __init__(self, n_embed):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embed, 4*n_embed),
+            nn.ReLU(),
+            nn.Linear(4*n_embed, n_embed),
+            nn.Dropout(dropout)
+        )
+    def forward(self, x):
+        return self.net(x)
+    
+class Block(nn.Module):
+    def __init__(self, n_embed, n_head):
+        super().__init__()
+        head_size = n_embed//n_head
+        self.sa_heads = MultiHeadAttention(n_head, head_size) # 4 heads of 8-dim self-attention
+        self.ffwd = feedForward(n_embed)
+        self.ln1 = nn.LayerNorm(n_embed)
+        self.ln2 = nn.LayerNorm(n_embed)
+
+
+    def __call__(self, x):
+        x = x + self.sa_heads(self.ln1(x))
+        x = x + self.ffwd(self.ln2(x))
+        return x 
+
 
 class BiagramLanguageModel(nn.Module):
 
@@ -101,7 +140,9 @@ class BiagramLanguageModel(nn.Module):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
         self.position_embedding_table = nn.Embedding(block_size, n_embed) # kodujemy pozeycje 
-        self.sa_heads = MultiHeadAttention(4, n_embed//4 ) # 4 heads of 8-dim self-attention
+
+        self.blocks = nn.Sequential(*[Block(n_embed, n_head) for _ in range(n_layer)])
+        self.ln_f = nn.LayerNorm(n_embed)
         self.lm_head = nn.Linear(n_embed, vocab_size)
     
     def forward(self, idx ,target=None):
@@ -112,7 +153,9 @@ class BiagramLanguageModel(nn.Module):
         pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # T,C
         x = token_emb + pos_emb # (B,T,C)
         
-        x = self.sa_heads(x)  
+        x = self.blocks(x)
+        x = self.ln_f(x)
+
         logits = self.lm_head(x) # B,T,vocab_size
 
         if target is None:
@@ -136,7 +179,7 @@ class BiagramLanguageModel(nn.Module):
 
             # focus only on the last time step 
             logits = logits[:,-1,:]
-            probs = F.softmax(logits, dim=1)
+            probs = F.softmax(logits, dim=-1)
 
             idx_next = torch.multinomial(probs, 1)
             idx = torch.cat((idx, idx_next), dim=1)
