@@ -6,10 +6,10 @@ from torch.nn import functional as F
 
 batch_size = 32
 block_size = 8
-max_iter = 3000
-eval_interval = 300
+max_iter = 5000
+eval_interval = 500
 eval_iters = 200
-learning_rate = 1e-2
+learning_rate = 1e-3
 n_embed = 32
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -58,12 +58,50 @@ def estimate_loss():
     return out
 
 
+class Head(nn.Module):
+
+    def __init__(self, head_size):
+        super().__init__()
+        self.query = torch.nn.Linear(n_embed, head_size, bias=False)# what am i looking for 
+        self.key = torch.nn.Linear(n_embed, head_size, bias=False)# what do i contain 
+        self.value = torch.nn.Linear(n_embed, head_size, bias=False)# 
+        # trilll not a parametr, so in pytorch confusion its call buffer 
+        # Buffers won’t be returned in model.parameters(), so that the optimizer won’t have a change to update them.
+        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+
+
+    def __call__(self, x):
+        B,T,C = x.shape
+
+        q = self.query(x) # B,T,Head_size
+        k = self.key(x) # B,T,Head_size
+        wei = q @ k.transpose(-2,-1) *  C**-0.5 #(B,T,head_size) @ (B,head_size,T)-->(B,T,T)
+
+        #future dosnt communicate with the past (decoder block) 
+        wei = wei.masked_fill(self.tril[:T,:T]==0, float('-inf')) # commend for encoder 
+        wei = F.softmax(wei, dim=1)
+
+        v = self.value(x)
+        out = wei @ v
+        return out
+
+class MultiHeadAttention(nn.Module):
+
+    def __init__(self, num_heads, head_size):
+        super().__init__()
+
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+
+    def __call__(self, x):
+        return torch.cat([h(x) for h in self.heads], dim=-1)
+
 class BiagramLanguageModel(nn.Module):
 
     def __init__(self):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
         self.position_embedding_table = nn.Embedding(block_size, n_embed) # kodujemy pozeycje 
+        self.sa_heads = MultiHeadAttention(4, n_embed//4 ) # 4 heads of 8-dim self-attention
         self.lm_head = nn.Linear(n_embed, vocab_size)
     
     def forward(self, idx ,target=None):
@@ -73,6 +111,8 @@ class BiagramLanguageModel(nn.Module):
         token_emb = self.token_embedding_table(idx) # B,T,C
         pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # T,C
         x = token_emb + pos_emb # (B,T,C)
+        
+        x = self.sa_heads(x)  
         logits = self.lm_head(x) # B,T,vocab_size
 
         if target is None:
@@ -90,7 +130,9 @@ class BiagramLanguageModel(nn.Module):
         # idx B,T
         # in generation become B,T+1 +1 +1 +1 ...
         for _ in range(max_new_token):
-            logits, loss = self(idx)
+            idx_cond = idx[:, -block_size:]
+
+            logits, loss = self(idx_cond)
 
             # focus only on the last time step 
             logits = logits[:,-1,:]
@@ -103,7 +145,7 @@ class BiagramLanguageModel(nn.Module):
 
 model = BiagramLanguageModel()
 model = model.to(device)
-optymizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+optymizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
 
 for iter in range(max_iter):
@@ -120,5 +162,5 @@ for iter in range(max_iter):
     loss.backward()
     optymizer.step()
 
-print(decode(model.generate(torch.zeros((1,1), dtype=torch.long), max_new_token=100)[0].tolist()))
+print(decode(model.generate(torch.zeros((1,1), dtype=torch.long), max_new_token=500)[0].tolist()))
 
